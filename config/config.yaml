@@ -1,9 +1,12 @@
 inetd_style: false
-host_key: ./id_rsa
+host_key: id_rsa
 connect_timeout: 5
 log_folder: /tmp/logs
 log_format: asciicast
-ca_keys: ca.pub
+ca_keys: host_ca.pub
+only_certs: true
+standalone_mode: true
+standalone_port: 2222
 acl:
   forwards:
     - port: 22

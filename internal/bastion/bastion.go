@@ -1,34 +1,40 @@
 package bastion
 
 import (
+	"fmt"
 	"net"
 	"os"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
-func Run() (err error) {
-	logconfig := zap.NewDevelopmentConfig()
-	logconfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	logger, err := logconfig.Build()
+func RunStandalone(c Config, log *zap.SugaredLogger) error {
+	sock, err := net.Listen("tcp", fmt.Sprintf(":%d", c.StandalonePort))
 	if err != nil {
-		return
-	}
-	defer logger.Sync()
-	log := logger.Sugar()
-
-	if len(os.Args) < 2 {
-		log.Fatalf("usage: %s config.yaml", os.Args[0])
+		return err
 	}
 
-	conf, err := ReadConfig(os.Args[1])
-	if err != nil {
-		return
-	}
-	log.Infow("loaded config", "conf", conf)
+	for {
+		conn, err := sock.Accept()
+		if err != nil {
+			log.Errorf("failed to accept connection: %s", err.Error())
+		}
 
+		log.Debugf("accepted connection")
+
+		go func(cn net.Conn) {
+			defer cn.Close()
+			s := NewServer(c, log)
+			if err := s.ProcessConnection(cn); err != nil {
+				log.Errorw("failed to process connection", "err", err)
+				return
+			}
+		}(conn)
+	}
+}
+
+func Run(conf Config, log *zap.SugaredLogger) (err error) {
 	var clientConn net.Conn
 	if conf.InetDStyle {
 		clientConn = stdioNetConn{}

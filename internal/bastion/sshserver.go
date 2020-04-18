@@ -15,6 +15,11 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const (
+	DefaultSSHPort = 22
+	SSHServerVersion = "SSH-2.0-OpenSSH_Go_Bastion"
+)
+
 // Server implements SSH server that client connects to
 type Server struct {
 	Conf Config
@@ -44,6 +49,7 @@ func NewServer(conf Config, log *zap.SugaredLogger) *Server {
 
 func (s *Server) authCallback(sc ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 	username := sc.User()
+	s.Infow("auth_callback for user", "user", username)
 	username = strings.Split(username, "/")[0]
 	meta := customSSHConnMetadata{
 		ConnMetadata: sc,
@@ -73,6 +79,10 @@ func (s *Server) authCallback(sc ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.P
 			"sessid", sc.SessionID(),
 		)
 		return perms, nil
+	}
+
+	if s.Conf.AllowOnlyCertificates {
+		return nil, errors.New("only certificates allowed")
 	}
 
 	usr, err := user.Lookup(username)
@@ -116,6 +126,7 @@ func (s *Server) processClient(sshChans <-chan ssh.NewChannel, reqs <-chan *ssh.
 				continue
 			}
 			s.Debugw("new channel request", "type", ch.ChannelType())
+
 			switch ch.ChannelType() {
 			case "session":
 				if s.noMoreSessions {
@@ -226,30 +237,79 @@ func (s *Server) processClient(sshChans <-chan ssh.NewChannel, reqs <-chan *ssh.
 	close(s.errs)
 }
 
+type User struct {
+	Username string
+	RemoteHost string
+	Port uint16
+}
+
+func parseUsername(username string) (*User, error) {
+	parts := strings.Split(username, "/")
+	if len(parts) > 3 {
+		return nil, fmt.Errorf("invalid username provided by client: %s", username)
+	}
+	result := &User{}
+	result.Username = parts[0]
+
+	if len(parts) > 1 {
+		result.RemoteHost = parts[1]
+	}
+
+	if len(parts) > 2 {
+		port, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid port value provided")
+		}
+
+		result.Port = uint16(port)
+	}
+
+	if result.Port == 0 {
+		result.Port = DefaultSSHPort
+	}
+
+	return result, nil
+}
+
+func createCertChecker(conf Config) (*ssh.CertChecker, error) {
+	if conf.CAKeys == "" {
+		return nil, errors.New("CAKeys parameter not set")
+	}
+
+	caKeys, err := readAuthorizedKeys(conf.CAKeys)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot read CAKeys")
+	}
+
+	return &ssh.CertChecker{
+		// TODO: implement source-addr checks
+		SupportedCriticalOptions: []string{},
+		IsUserAuthority: func(auth ssh.PublicKey) bool {
+			_, ok := caKeys[string(auth.Marshal())]
+			return ok
+		},
+		IsRevoked: func(cert *ssh.Certificate) bool {
+			// TODO: implement revocation check
+			return false
+		},
+	}, nil
+}
+
 func (s *Server) ProcessConnection(nConn net.Conn) (err error) {
 	hostKey, err := readHostKey(s.Conf.HostKey)
 	if err != nil {
 		return errors.Wrap(err, "failed to read host key")
 	}
 
-	if s.Conf.CAKeys != "" {
-		caKeys, err := readAuthorizedKeys(s.Conf.CAKeys)
-		if err != nil {
-			return errors.Wrap(err, "failed to read CA keys")
-		}
-		s.certChecker = &ssh.CertChecker{
-			// TODO: implement source-addr checks
-			SupportedCriticalOptions: []string{},
-			IsUserAuthority: func(auth ssh.PublicKey) bool {
-				_, ok := caKeys[string(auth.Marshal())]
-				return ok
-			},
-		}
+	certChecker, err := createCertChecker(s.Conf)
+	if err != nil {
+		return errors.Wrap(err, "can't create cert checker")
 	}
+	s.certChecker = certChecker
 
 	serverConf := &ssh.ServerConfig{
 		// OpenSSH-specific extensions compatibility
-		ServerVersion:     "SSH-2.0-OpenSSH_Go_Bastion",
+		ServerVersion:     SSHServerVersion,
 		PublicKeyCallback: s.authCallback,
 	}
 	serverConf.AddHostKey(hostKey)
@@ -261,29 +321,17 @@ func (s *Server) ProcessConnection(nConn net.Conn) (err error) {
 	defer conn.Close()
 
 	s.SugaredLogger = s.SugaredLogger.With(
-		"sessid", conn.SessionID()[:6], // save some space in logs
+		"sessionid", conn.SessionID(), // save some space in logs
 	)
-	parts := strings.Split(conn.User(), "/")
-	if len(parts) > 3 {
-		return errors.New("invalid username provided, can be 'username[/remoteHost[/remotePort]]'")
-	}
 
-	s.remoteUser = parts[0]
-	if len(parts) > 1 {
-		s.remoteHost = parts[1]
+	user, err := parseUsername(conn.User())
+	if err != nil {
+		return err
 	}
-	if len(parts) > 2 {
-		port, err := strconv.Atoi(parts[2])
-		if err != nil {
-			return fmt.Errorf("invalid remote port: %v", parts[2])
-		}
-		s.remotePort = uint16(port)
-	} else if s.remotePort == 0 {
-		s.remotePort = 22
-	}
-
+	s.remoteUser, s.remoteHost, s.remotePort = user.Username, user.RemoteHost, user.Port
 	s.sessId = conn.SessionID()
 	s.sshConn = conn
+
 	s.Infow("authentication succeded", "user", conn.User())
 
 	s.agent = &ClientAgent{

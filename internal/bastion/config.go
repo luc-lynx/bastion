@@ -21,14 +21,17 @@ type ACLConfig struct {
 
 //noinspection GoStructTag
 type Config struct {
-	InetDStyle        bool          `yaml:"inetd_style"`
-	HostKey           string        `yaml:"host_key"`
-	ConnectTimeoutSec uint          `yaml:"connect_timeout"`
-	ConnectTimeout    time.Duration `yaml:"-"`
-	LogFormat         string        `yaml:"log_format"`
-	LogFolder         string        `yaml:"log_folder"`
-	CAKeys            string        `yaml:"ca_keys"`
-	ACL               ACLConfig
+	InetDStyle            bool          `yaml:"inetd_style"`
+	HostKey               string        `yaml:"host_key"`
+	ConnectTimeoutSec     uint          `yaml:"connect_timeout"`
+	ConnectTimeout        time.Duration `yaml:"-"`
+	LogFormat             string        `yaml:"log_format"`
+	LogFolder             string        `yaml:"log_folder"`
+	CAKeys                string        `yaml:"ca_keys"`
+	AllowOnlyCertificates bool          `yaml:"only_certs"`
+	StandaloneMode        bool          `yaml:"standalone_mode"`
+	StandalonePort        uint          `yaml:"standalone_port"`
+	ACL                   ACLConfig
 }
 
 func ReadConfig(fname string) (c Config, err error) {

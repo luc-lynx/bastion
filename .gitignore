@@ -1,3 +1,6 @@
 id_rsa*
 .idea
 ca.pub
+host_ca
+*.pub
+user_key*
