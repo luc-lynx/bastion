@@ -18,6 +18,8 @@ import (
 const (
 	DefaultSSHPort = 22
 	SSHServerVersion = "SSH-2.0-OpenSSH_Go_Bastion"
+	OldBastionPrefix = "/tmp/.fwd/localhost/"
+	Localhost = "127.0.0.1"
 )
 
 // Server implements SSH server that client connects to
@@ -113,6 +115,52 @@ func (s *Server) authCallback(sc ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.P
 	return nil, fmt.Errorf("unknown public key for %q", sc.User())
 }
 
+func handleProxyJump(remoteHost string, port uint16, logger *zap.SugaredLogger, cnf Config, ch ssh.NewChannel) error {
+	innerServer := NewServer(cnf, logger)
+	innerServer.remoteHost = remoteHost
+	innerServer.remotePort = port
+
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("failed to accept ssh channel for %s:%d", remoteHost, port))
+	}
+
+	go ssh.DiscardRequests(reqs)
+	return innerServer.ProcessConnection(fakeNetConn{channel})
+}
+
+func readStreamlocalParams(channel ssh.NewChannel) (*ssh_types.ChannelOpenDirectMsg, error) {
+	var udsForwardRequest ssh_types.ChannelOpenDirectUDSMsg
+	if err := ssh.Unmarshal(channel.ExtraData(), &udsForwardRequest); err != nil {
+		return nil, errors.Wrap(err, "error parsing uds request")
+	}
+
+	if strings.Index(udsForwardRequest.RAddr, OldBastionPrefix) == 0 {
+		var result ssh_types.ChannelOpenDirectMsg
+		result.LAddr = udsForwardRequest.LAddr
+		result.LPort = udsForwardRequest.LPort
+		result.RAddr = Localhost
+		port, err := strconv.Atoi(udsForwardRequest.RAddr[len(OldBastionPrefix):])
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid port number in forward request")
+		}
+		result.RPort = uint32(port)
+		return &result, nil
+	} else {
+		return nil, errors.New("unix domain sockets are't supported")
+	}
+}
+
+func readDirectTcpParams(channel ssh.NewChannel) (*ssh_types.ChannelOpenDirectMsg, error) {
+	var result ssh_types.ChannelOpenDirectMsg
+	err := ssh.Unmarshal(channel.ExtraData(), &result)
+	if err != nil {
+		return nil, errors.Wrap(err, "error parsing direct tcp-ip request")
+	}
+
+	return &result, nil
+}
+
 func (s *Server) processClient(sshChans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
 	for {
 		if sshChans == nil && reqs == nil {
@@ -143,53 +191,26 @@ func (s *Server) processClient(sshChans <-chan ssh.NewChannel, reqs <-chan *ssh.
 			case "direct-tcpip", "direct-streamlocal@openssh.com":
 				var tcpForwardReq ssh_types.ChannelOpenDirectMsg
 				if ch.ChannelType() == "direct-streamlocal@openssh.com" {
-					var udsForwardReq ssh_types.ChannelOpenDirectUDSMsg
-					if err := ssh.Unmarshal(ch.ExtraData(), &udsForwardReq); err != nil {
-						s.errs <- errors.Wrap(err, "error parsing uds request")
+					params, err := readStreamlocalParams(ch)
+					if err != nil {
+						s.errs <- ch.Reject(ssh.Prohibited, err.Error())
 						continue
 					}
-					oldBastionPrefix := "/tmp/.fwd/localhost/"
-					if strings.Index(udsForwardReq.RAddr, oldBastionPrefix) == 0 {
-						tcpForwardReq.LAddr = udsForwardReq.LAddr
-						tcpForwardReq.LPort = udsForwardReq.LPort
-						tcpForwardReq.RAddr = "127.0.0.1"
-						port, err := strconv.Atoi(udsForwardReq.RAddr[len(oldBastionPrefix):])
-						if err != nil {
-							s.errs <- ch.Reject(ssh.Prohibited, "invalid port in forward request")
-							continue
-						}
-						tcpForwardReq.RPort = uint32(port)
-					} else {
-						s.errs <- ch.Reject(ssh.Prohibited, "UDS not yet supported")
-						continue
-					}
+					tcpForwardReq = *params
 				} else {
-					if err := ssh.Unmarshal(ch.ExtraData(), &tcpForwardReq); err != nil {
-						s.errs <- errors.Wrap(err, "error parsing tcpip request")
+					params, err := readDirectTcpParams(ch)
+					if err != nil {
+						s.errs <- err
 						continue
 					}
+					tcpForwardReq = *params
 				}
 
 				s.Infow("tcpip request", "req", tcpForwardReq)
 
 				if s.client == nil && tcpForwardReq.LPort == 65535 && tcpForwardReq.LAddr == "127.0.0.1" {
 					s.Info("OpenSSH connects with -J")
-					innerServer := NewServer(s.Conf, s.SugaredLogger)
-					innerServer.remoteHost = tcpForwardReq.RAddr
-					innerServer.remotePort = uint16(tcpForwardReq.RPort)
-
-					channel, reqs, err := ch.Accept()
-					if err != nil {
-						s.errs <- errors.Wrap(err, "failed to accept channel")
-						return
-					}
-					s.Info("accepted stdio forward channel")
-
-					// no requests here
-					go ssh.DiscardRequests(reqs)
-					if err = innerServer.ProcessConnection(fakeNetConn{channel}); err != nil {
-						s.errs <- NewCritical(errors.Wrap(err, "failed process inner conn"))
-					}
+					s.errs <- handleProxyJump(tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort), s.SugaredLogger, s.Conf, ch)
 					return
 				}
 
