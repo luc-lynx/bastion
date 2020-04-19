@@ -10,47 +10,43 @@ import (
 )
 
 type tcpConfig struct {
-	newCh   ssh.NewChannel
-	serv    *Server
-	srcHost string
-	srcPort uint16
 	dstHost string
 	dstPort uint16
+	server  *Server
+	channel ssh.NewChannel
 }
 
-func HandleTCP(tc *tcpConfig) {
-	errs := tc.serv.errs
-	log := tc.serv.SugaredLogger
+func NewTCPConnectionHandler(channel ssh.NewChannel, server *Server, dstHost string, dstPort uint16) (*tcpConfig, error) {
+	return &tcpConfig{
+		dstHost: dstHost,
+		dstPort: dstPort,
+		server: server,
+		channel: channel,
+	}, nil
+}
 
-	if tc.serv.client == nil {
-		errs <- tc.newCh.Reject(ssh.ConnectionFailed, "have not connected to remote yet")
-		return
+func (t *tcpConfig) Run() {
+	if t.server.client == nil {
+		t.server.errorsChannel <- t.channel.Reject(ssh.ConnectionFailed, "there's no connection active connection open")
 	}
 
-	// TODO: validate host
-	dest := fmt.Sprintf("%s:%d", tc.dstHost, tc.dstPort)
-	log.Info("dialing tcp", "dest", dest)
-	conn, err := tc.serv.client.Dial("tcp", dest)
+	t.server.Info("dialing tcp", "host", t.dstHost, "port", t.dstPort)
+	conn, err := t.server.client.Dial("tcp", fmt.Sprintf("%s:%d", t.dstHost, t.dstPort))
 	if err != nil {
-		// TODO: do not expose errors
-		errs <- tc.newCh.Reject(ssh.ConnectionFailed, err.Error())
-		errs <- err
+		t.server.errorsChannel <- errors.Wrap(err, "couldn't dial")
+		t.server.errorsChannel <- t.channel.Reject(ssh.ConnectionFailed, "couldn't connect to a remote host")
 		return
 	}
 	defer conn.Close()
 
-	log.Info("accepting request")
-	channel, reqs, err := tc.newCh.Accept()
+	channel, requests, err := t.channel.Accept()
 	if err != nil {
-		errs <- errors.Wrap(err, "failed to accept channel")
+		t.server.errorsChannel <- errors.Wrap(err, "failed to accept channel")
 		return
 	}
-	log.Info("accepted tcp channel")
-
-	// no requests here
-	go ssh.DiscardRequests(reqs)
-
+	t.server.Info("channel accepted")
 	defer channel.Close()
+	go ssh.DiscardRequests(requests)
 
 	tcpLog := logger.TCPLogger{
 		Logger: logger.Logger{
@@ -58,18 +54,19 @@ func HandleTCP(tc *tcpConfig) {
 			ClientOut:  channel,
 			ServerIn:   conn,
 			ServerOut:  conn,
-			Username:   tc.serv.remoteUser,
-			Hostname:   tc.dstHost,
-			SessId:     tc.serv.sessId,
-			RootFolder: tc.serv.Conf.LogFolder,
+			Username:   t.server.remoteUser,
+			Hostname:   t.dstHost,
+			SessId:     t.server.sessionID,
+			RootFolder: t.server.Conf.LogFolder,
 		},
 		// TODO
 		Src:     net.IP{127, 0, 0, 1},
-		Dst:     net.IP{8, 8, 8, 8},
-		SrcPort: tc.srcPort,
-		DstPort: tc.dstPort,
+		Dst:     net.IP{1, 1, 1, 1},
+		SrcPort: 22,
+		DstPort: t.dstPort,
 	}
-	if err = tcpLog.Start(); err != nil {
-		log.Errorw("error while writing TCP log", "err", err)
+
+	if err := tcpLog.Start(); err != nil {
+		t.server.Errorw("error writing tcp log", "err", err)
 	}
 }

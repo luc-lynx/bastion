@@ -43,17 +43,17 @@ const (
 	NocauthPort = "NOCAUTH_PORT"
 )
 
-func HandleSession(sc *sessionConfig) {
+func HandleSshSession(sc *sessionConfig) {
 	channel, reqs, err := sc.newCh.Accept()
 	if err != nil {
-		sc.serv.errs <- err
+		sc.serv.errorsChannel <- err
 		return
 	}
 
 	s := Session{
 		sessionConfig: sc,
 		SugaredLogger: sc.serv.SugaredLogger,
-		errs:          sc.serv.errs,
+		errs:          sc.serv.errorsChannel,
 		Channel:       channel,
 		clientReqs:    make(chan interface{}),
 		sessionUserOptions: sessionUserOptions{
@@ -61,7 +61,7 @@ func HandleSession(sc *sessionConfig) {
 		},
 	}
 
-	s.handleReqs(reqs)
+	s.handleRequests(reqs)
 }
 
 func (s *Session) writeInfo(msg string, args ...interface{}) error {
@@ -82,7 +82,7 @@ func (s *Session) writeErrClose(msg string, args ...interface{}) error {
 	return s.Close()
 }
 
-func (s *Session) handleReqs(in <-chan *ssh.Request) {
+func (s *Session) handleRequests(in <-chan *ssh.Request) {
 	for req := range in {
 		s.Debugw("channel request", "req", req, "ch", s.Channel)
 
@@ -293,7 +293,7 @@ func (s *Session) startClientSession(cmd string) error {
 			ServerOut:  sess.Stdout,
 			Username:   user,
 			Hostname:   host,
-			SessId:     s.serv.sessId,
+			SessId:     s.serv.sessionID,
 			RootFolder: s.serv.Conf.LogFolder,
 		},
 		ClientErr: s.Channel.Stderr(),

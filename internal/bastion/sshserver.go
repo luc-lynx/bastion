@@ -1,6 +1,7 @@
 package bastion
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/user"
@@ -28,17 +29,36 @@ type Server struct {
 	*zap.SugaredLogger
 	acl *ACLValidator
 
-	sshConn     *ssh.ServerConn
-	sessId      []byte
+	sshConn            *ssh.ServerConn
+	sshNewChannels     <-chan ssh.NewChannel
+	sshRequestsChannel <-chan *ssh.Request
+	errorsChannel      chan error
+	ctx                context.Context
+
+	sessionID   []byte
 	remoteUser  string
 	remoteHost  string
 	remotePort  uint16
 	agent       *ClientAgent
 	certChecker *ssh.CertChecker
-	errs        chan error
 
 	client         *client.Client
+	mtx            sync.RWMutex
 	noMoreSessions bool
+}
+
+func (s *Server) SetNoMoreSessions(value bool) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	s.noMoreSessions = value
+}
+
+func (s *Server) GetNoMoreSessions()bool {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	return s.noMoreSessions
 }
 
 func NewServer(conf Config, log *zap.SugaredLogger) *Server {
@@ -126,7 +146,7 @@ func handleProxyJump(remoteHost string, port uint16, logger *zap.SugaredLogger, 
 	}
 
 	go ssh.DiscardRequests(reqs)
-	return innerServer.ProcessConnection(fakeNetConn{channel})
+	return innerServer.HandleConnection(fakeNetConn{channel})
 }
 
 func readStreamlocalParams(channel ssh.NewChannel) (*ssh_types.ChannelOpenDirectMsg, error) {
@@ -161,101 +181,92 @@ func readDirectTcpParams(channel ssh.NewChannel) (*ssh_types.ChannelOpenDirectMs
 	return &result, nil
 }
 
-func (s *Server) processClient(sshChans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
-	for {
-		if sshChans == nil && reqs == nil {
-			break
+func (s *Server) dispatchChannelRequest(ch ssh.NewChannel) {
+	channelType := ch.ChannelType()
+	s.Infow("dispatching new channel request, channelType=%s", channelType)
+	switch channelType {
+	case "session":
+		if s.GetNoMoreSessions() {
+			s.errorsChannel <- ch.Reject(ssh.Prohibited, "no-more-sessions flag is set")
+			return
+		}
+		// TODO: refactor
+		go HandleSshSession(&sessionConfig{
+			newCh: ch,
+			serv: s,
+		})
+	case "direct-tcpip", "direct-streamlocal@openssh.com":
+		var tcpForwardReq ssh_types.ChannelOpenDirectMsg
+		if ch.ChannelType() == "direct-streamlocal@openssh.com" {
+			params, err := readStreamlocalParams(ch)
+			if err != nil {
+				s.errorsChannel <- ch.Reject(ssh.Prohibited, err.Error())
+				return
+			}
+			tcpForwardReq = *params
+		} else {
+			params, err := readDirectTcpParams(ch)
+			if err != nil {
+				s.errorsChannel <- err
+				return
+			}
+			tcpForwardReq = *params
 		}
 
-		select {
-		case ch, ok := <-sshChans:
-			if !ok {
-				sshChans = nil
-				continue
-			}
-			s.Debugw("new channel request", "type", ch.ChannelType())
+		s.Infow("tcpip request", "req", tcpForwardReq)
 
-			switch ch.ChannelType() {
-			case "session":
-				if s.noMoreSessions {
-					s.errs <- ch.Reject(ssh.Prohibited, "no-more-sessions was sent")
-					continue
-				}
-				s.Infow("session request")
+		if s.client == nil && tcpForwardReq.LPort == 65535 && tcpForwardReq.LAddr == Localhost {
+			s.Info("OpenSSH connects with -J")
+			s.errorsChannel <- handleProxyJump(tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort), s.SugaredLogger, s.Conf, ch)
+			return
+		}
 
-				go HandleSession(&sessionConfig{
-					newCh: ch,
-					serv:  s,
-				})
+		if !s.acl.CheckForward(s.remoteUser, tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort)) {
+			s.Warnw("access denied")
+			s.errorsChannel <- ch.Reject(ssh.Prohibited, "access denied")
+			return
+		}
 
-			case "direct-tcpip", "direct-streamlocal@openssh.com":
-				var tcpForwardReq ssh_types.ChannelOpenDirectMsg
-				if ch.ChannelType() == "direct-streamlocal@openssh.com" {
-					params, err := readStreamlocalParams(ch)
-					if err != nil {
-						s.errs <- ch.Reject(ssh.Prohibited, err.Error())
-						continue
-					}
-					tcpForwardReq = *params
-				} else {
-					params, err := readDirectTcpParams(ch)
-					if err != nil {
-						s.errs <- err
-						continue
-					}
-					tcpForwardReq = *params
-				}
+		tcp, err := NewTCPConnectionHandler(ch, s, tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort))
+		if err != nil {
+			s.errorsChannel <- err
+			return
+		}
+		go tcp.Run()
+	case "x11", "forwarded-tcpip", "tun@openssh.com", "forwarded-streamlocal@openssh.com":
+		s.errorsChannel <- ch.Reject(ssh.Prohibited, fmt.Sprintf("channel type %s is not supported", channelType))
+	default:
+		s.errorsChannel <- ch.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel %s", channelType))
+	}
+}
 
-				s.Infow("tcpip request", "req", tcpForwardReq)
-
-				if s.client == nil && tcpForwardReq.LPort == 65535 && tcpForwardReq.LAddr == "127.0.0.1" {
-					s.Info("OpenSSH connects with -J")
-					s.errs <- handleProxyJump(tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort), s.SugaredLogger, s.Conf, ch)
-					return
-				}
-
-				if !s.acl.CheckForward(s.remoteUser, tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort)) {
-					s.Warnw("access denied")
-					s.errs <- ch.Reject(ssh.Prohibited, "access denied")
-					continue
-				}
-
-				go HandleTCP(&tcpConfig{
-					newCh:   ch,
-					serv:    s,
-					srcHost: tcpForwardReq.LAddr,
-					srcPort: uint16(tcpForwardReq.LPort),
-					dstHost: tcpForwardReq.RAddr,
-					dstPort: uint16(tcpForwardReq.RPort),
-				})
-
-			case "x11", "forwarded-tcpip", "tun@openssh.com", "forwarded-streamlocal@openssh.com":
-				s.errs <- ch.Reject(ssh.Prohibited, fmt.Sprintf("using %s is prohibited", ch.ChannelType()))
-			default:
-				s.errs <- ch.Reject(ssh.UnknownChannelType, "unknown channel type")
-			}
-
-		case req, ok := <-reqs:
-			if !ok {
-				reqs = nil
-				continue
-			}
-			s.Debugw("global request", "req", req)
-			switch req.Type {
-			case "keepalive@openssh.com":
-				s.errs <- req.Reply(true, nil)
-			case "no-more-sessions@openssh.com":
-				s.noMoreSessions = true
-			default:
-				// "[cancel-]tcpip-forward" falls here
-				if req.WantReply {
-					s.errs <- req.Reply(false, nil)
-				}
-			}
+func (s *Server) dispatchNewRequest(request *ssh.Request) {
+	s.Infow("dispatching request type", "requestType", request.Type)
+	switch request.Type {
+	case "keepalive@openssh.com":
+		s.errorsChannel <- request.Reply(true, nil)
+	case "no-more-sessions@openssh.com":
+		s.SetNoMoreSessions(true)
+	default:
+		if request.WantReply {
+			s.errorsChannel <- request.Reply(false, nil)
 		}
 	}
+}
 
-	close(s.errs)
+func (s *Server) Run() {
+	for {
+		select {
+		case ch := <- s.sshNewChannels:
+			s.dispatchChannelRequest(ch)
+		case request := <- s.sshRequestsChannel:
+			s.dispatchNewRequest(request)
+		case <- s.ctx.Done():
+			s.errorsChannel <- s.ctx.Err()
+			close(s.errorsChannel)
+			return
+		}
+	}
 }
 
 type User struct {
@@ -316,7 +327,7 @@ func createCertChecker(conf Config) (*ssh.CertChecker, error) {
 	}, nil
 }
 
-func (s *Server) ProcessConnection(nConn net.Conn) (err error) {
+func (s *Server) HandleConnection(nConn net.Conn) (err error) {
 	hostKey, err := readHostKey(s.Conf.HostKey)
 	if err != nil {
 		return errors.Wrap(err, "failed to read host key")
@@ -335,36 +346,38 @@ func (s *Server) ProcessConnection(nConn net.Conn) (err error) {
 	}
 	serverConf.AddHostKey(hostKey)
 
-	conn, chans, globalReqs, err := ssh.NewServerConn(nConn, serverConf)
+	connection, newChannels, globalRequests, err := ssh.NewServerConn(nConn, serverConf)
 	if err != nil {
 		return errors.Wrap(err, "failed to handshake")
 	}
-	defer conn.Close()
+	defer connection.Close()
 
 	s.SugaredLogger = s.SugaredLogger.With(
-		"sessionid", conn.SessionID(), // save some space in logs
+		"sessionid", connection.SessionID(), // save some space in logs
 	)
 
-	user, err := parseUsername(conn.User())
+	usr, err := parseUsername(connection.User())
 	if err != nil {
 		return err
 	}
-	s.remoteUser, s.remoteHost, s.remotePort = user.Username, user.RemoteHost, user.Port
-	s.sessId = conn.SessionID()
-	s.sshConn = conn
+	s.remoteUser, s.remoteHost, s.remotePort = usr.Username, usr.RemoteHost, usr.Port
+	s.sessionID = connection.SessionID()
+	s.sshConn = connection
+	s.sshNewChannels = newChannels
+	s.sshRequestsChannel = globalRequests
 
-	s.Infow("authentication succeded", "user", conn.User())
+	s.Infow("authentication succeded", "user", connection.User())
 
 	s.agent = &ClientAgent{
 		Mutex:         &sync.Mutex{},
 		SugaredLogger: s.SugaredLogger,
-		sshConn:       conn,
+		sshConn:       connection,
 	}
 
-	s.errs = make(chan error)
-	go s.processClient(chans, globalReqs)
+	s.errorsChannel = make(chan error)
+	go s.Run()
 
-	for err := range s.errs {
+	for err := range s.errorsChannel {
 		if err != nil {
 			if _, ok := err.(CriticalError); ok {
 				return errors.Wrap(err, "critical error in channel")

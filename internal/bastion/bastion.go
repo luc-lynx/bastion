@@ -26,7 +26,7 @@ func RunStandalone(c Config, log *zap.SugaredLogger) error {
 		go func(cn net.Conn, logger *zap.SugaredLogger) {
 			defer cn.Close()
 			s := NewServer(c, logger)
-			if err := s.ProcessConnection(cn); err != nil {
+			if err := s.HandleConnection(cn); err != nil {
 				log.Errorw("failed to process connection", "err", err)
 				return
 			}
@@ -47,7 +47,7 @@ func Run(conf Config, log *zap.SugaredLogger) (err error) {
 	}
 
 	server := NewServer(conf, log)
-	if err = server.ProcessConnection(clientConn); err != nil {
+	if err = server.HandleConnection(clientConn); err != nil {
 		log.Errorw("error while handling connection", "err", err)
 		return
 	}
