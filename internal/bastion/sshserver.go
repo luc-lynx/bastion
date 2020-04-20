@@ -103,6 +103,9 @@ func (s *Server) authCallback(sc ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.P
 		return perms, nil
 	}
 
+	//TODO: remove (accept all users)
+	return &ssh.Permissions{}, nil
+
 	if s.Conf.AllowOnlyCertificates {
 		return nil, errors.New("only certificates allowed")
 	}
@@ -181,9 +184,35 @@ func readDirectTcpParams(channel ssh.NewChannel) (*ssh_types.ChannelOpenDirectMs
 	return &result, nil
 }
 
+func IsProxyJumpRequest(request ssh_types.ChannelOpenDirectMsg) bool {
+	if request.RPort == 22 && request.LAddr == Localhost && request.LPort == 65535 {
+		return true
+	}
+	return false
+}
+
+func FixHostPort(host string, port uint16) (string, uint16, error) {
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		if len(parts) != 2 {
+			return "", 0, errors.New("bad host format")
+		}
+
+		realHost := parts[0]
+		realPort, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return  "", 0, errors.Wrap(err, "bad host format, cannot parse port value")
+		}
+
+		return realHost, uint16(realPort), nil
+	}
+
+	return host, port, nil
+}
+
 func (s *Server) dispatchChannelRequest(ch ssh.NewChannel) {
 	channelType := ch.ChannelType()
-	s.Infow("dispatching new channel request, channelType=%s", channelType)
+	s.Infow("dispatching new channel request", "channelType", channelType)
 	switch channelType {
 	case "session":
 		if s.GetNoMoreSessions() {
@@ -215,9 +244,21 @@ func (s *Server) dispatchChannelRequest(ch ssh.NewChannel) {
 
 		s.Infow("tcpip request", "req", tcpForwardReq)
 
-		if s.client == nil && tcpForwardReq.LPort == 65535 && tcpForwardReq.LAddr == Localhost {
+		if IsProxyJumpRequest(tcpForwardReq) {
 			s.Info("OpenSSH connects with -J")
-			s.errorsChannel <- handleProxyJump(tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort), s.SugaredLogger, s.Conf, ch)
+			// TODO: check if we really need that
+			if s.client != nil {
+				s.errorsChannel <- ch.Reject(ssh.Prohibited, "the client connection has already been initiated")
+				return
+			}
+
+			host, port, err := FixHostPort(tcpForwardReq.RAddr, uint16(tcpForwardReq.RPort))
+			if err != nil {
+				s.errorsChannel <- ch.Reject(ssh.ConnectionFailed, err.Error())
+				return
+			}
+
+			s.errorsChannel <- handleProxyJump(host, port, s.SugaredLogger, s.Conf, ch)
 			return
 		}
 
@@ -365,6 +406,8 @@ func (s *Server) HandleConnection(nConn net.Conn) (err error) {
 	s.sshConn = connection
 	s.sshNewChannels = newChannels
 	s.sshRequestsChannel = globalRequests
+	// TODO: cancellation
+	s.ctx = context.Background()
 
 	s.Infow("authentication succeded", "user", connection.User())
 

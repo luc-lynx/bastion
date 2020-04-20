@@ -75,7 +75,7 @@ func (s *Session) writeErrClose(msg string, args ...interface{}) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.SendRequest("exit-status", false, ssh.Marshal(ssh_types.ExitStatusMsg{1}))
+	_, err = s.SendRequest("exit-status", false, ssh.Marshal(ssh_types.ExitStatusMsg{ExitStatus: 1}))
 	if err != nil {
 		return err
 	}
