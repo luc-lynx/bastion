@@ -24,7 +24,7 @@ func RunStandalone(c Config, log *zap.SugaredLogger) error {
 		log.Debugf("accepted connection")
 
 		go func(cn net.Conn, logger *zap.SugaredLogger) {
-			defer cn.Close()
+			defer func() { _ = cn.Close() }()
 			s := NewServer(c, logger)
 			if err := s.HandleConnection(cn); err != nil {
 				log.Errorw("failed to process connection", "err", err)
